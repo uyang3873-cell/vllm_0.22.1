@@ -1,0 +1,274 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""2-bit tensor-sym expert planes — Ascend CANN adaptation.
+
+Load-time GPU quantizer + fragment-major plane packer. The quantization
+is the QUANT_PROBE-validated K=4 sign-symmetric codebook {-4, -1, 1, 4}
+(acceptance 2.73 vs 2.68 baseline): every weight value maps to the
+nearest level with odd-symmetric tie-breaking.
+
+ADDED for Ascend: `int8_per_row_to_codes_scales` — handles the target
+model's INT8 per-row scale+offset format by dequantizing to f64 and
+feeding the same sweep-validated requant pipeline.
+
+Mapping (e2m1 nibble -> 2-bit code), code order {0:-4, 1:-1, 2:+1, 3:+4}:
+  +vals [0, .5, 1, 1.5, 2, 3, 4, 6] -> [+1 x5, +4 x3] -> codes [2,2,2,2,2,3,3,3]
+  -vals (nibble | 8)                -> [-1 x5, -4 x3] -> codes [1,1,1,1,1,0,0,0]
+Scales: block-32 UE8M0 bytes kept VERBATIM.
+
+Plane layout (fragment-major, per expert weight matrix [N, K]):
+  for each 16-row block nb (N/16), for each k64 block kb (K/64),
+  for each lane (g, t) in (8, 4):
+    8 bytes = codes for the lane's QMMA fragment chunks, in order:
+      [t0 k32a lo, t0 k32a hi, t0 k32b lo, t0 k32b hi,
+       t1 k32a lo, t1 k32a hi, t1 k32b lo, t1 k32b hi]
+    where t0 row = nb*16 + g, t1 row = nb*16 + g + 8,
+          k32a = kb*64, k32b = kb*64 + 32,
+          lo = weights [k + 4t .. 4t+3], hi = [k + 16 + 4t .. +3],
+          each 4-weight chunk packs little-endian: code(k+4t) in bits 0-1.
+  => plane bytes = N/16 * K/64 * 32 lanes * 8 = N*K/4.
+"""
+
+import os
+
+import torch
+
+# e2m1 nibble -> 2-bit code (tensor-sym {-4,-1,1,4})
+_NIBBLE_TO_CODE = torch.tensor(
+    [2, 2, 2, 2, 2, 3, 3, 3,   # +0,.5,1,1.5,2,3,4,6
+     1, 1, 1, 1, 1, 0, 0, 0],  # -0,-.5,-1,-1.5,-2,-3,-4,-6
+    dtype=torch.uint8)
+
+# 2-bit code -> e2m1 nibble of the reconstructed level (for golden tests)
+_CODE_TO_NIBBLE = torch.tensor([0xE, 0xA, 0x2, 0x6], dtype=torch.uint8)
+
+# --- split-FP4 refinement ------------------------------------------------
+_MAG_TO_REF = torch.tensor([0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.uint8)
+_REF_TO_VAL_SMALL = torch.tensor([0.5, 1.0, 1.5, 2.0])
+_REF_TO_VAL_BIG = torch.tensor([3.0, 4.0, 6.0, 6.0])
+
+
+def nibbles_to_refinement(nib: torch.Tensor) -> torch.Tensor:
+    """e2m1 nibbles (u8, 0..15) -> 2-bit refinement codes."""
+    return _MAG_TO_REF.to(nib.device)[(nib & 7).long()]
+
+
+def split_fp4_dequant(nib: torch.Tensor) -> torch.Tensor:
+    """Values the SPLIT decode reconstructs from e2m1 nibbles."""
+    dev = nib.device
+    mag = (nib & 7).long()
+    code = _NIBBLE_TO_CODE.to(dev)[nib.long()]
+    ref = _MAG_TO_REF.to(dev)[mag].long()
+    big = (code == 0) | (code == 3)
+    val = torch.where(big, _REF_TO_VAL_BIG.to(dev)[ref],
+                      _REF_TO_VAL_SMALL.to(dev)[ref])
+    return torch.where(code <= 1, -val, val)
+
+
+# 2-bit code -> e4m3 byte (the kernel's PRMT LUT): -4,-1,1,4
+PRMT_LUT_WORD = 0x4838B8C8
+
+
+def mxfp4_to_codes(w_packed: torch.Tensor) -> torch.Tensor:
+    """[..., K/2] u8 packed e2m1 pairs -> [..., K] u8 2-bit codes (0..3).
+    Nibble order: low nibble = even k (matches mxfp4 packing)."""
+    lut = _NIBBLE_TO_CODE.to(w_packed.device)
+    lo = lut[(w_packed & 0xF).long()]
+    hi = lut[(w_packed >> 4).long()]
+    return torch.stack((lo, hi), dim=-1).flatten(-2)
+
+
+def pack_fragment_major(codes: torch.Tensor) -> torch.Tensor:
+    """[N, K] u8 codes (0..3) -> fragment-major plane [N*K/4] u8."""
+    N, K = codes.shape
+    assert N % 16 == 0 and K % 64 == 0
+    c = codes.view(N // 16, 2, 8, K // 64, 2, 2, 4, 4)
+    c = c.permute(0, 3, 2, 6, 1, 4, 5, 7).contiguous()
+    c = c.view(-1, 4).to(torch.int32)
+    packed = (c[:, 0] | (c[:, 1] << 2) | (c[:, 2] << 4) | (c[:, 3] << 6))
+    return packed.to(torch.uint8).flatten()
+
+
+def quantize_expert(w_packed: torch.Tensor) -> torch.Tensor:
+    """mxfp4 [N, K/2] u8 -> fragment-major 2-bit plane [N*K/4] u8."""
+    return pack_fragment_major(mxfp4_to_codes(w_packed))
+
+
+def mxfp4_to_nibbles(w_packed: torch.Tensor) -> torch.Tensor:
+    """[..., K/2] u8 packed e2m1 pairs -> [..., K] u8 raw nibbles (0..15)."""
+    lo = w_packed & 0xF
+    hi = w_packed >> 4
+    return torch.stack((lo, hi), dim=-1).flatten(-2)
+
+
+def pack_fp4_fragment_major(codes: torch.Tensor) -> torch.Tensor:
+    """[N, K] u8 e2m1 nibbles -> fragment-major FP4 plane [N*K/2] u8."""
+    N, K = codes.shape
+    assert N % 16 == 0 and K % 64 == 0
+    c = codes.view(N // 16, 2, 8, K // 64, 2, 2, 4, 4)
+    c = c.permute(0, 3, 2, 6, 1, 4, 5, 7).contiguous()
+    c = c.view(-1, 2).to(torch.int16)
+    return (c[:, 0] | (c[:, 1] << 4)).to(torch.uint8).flatten()
+
+
+# e2m1 magnitude grid and the midpoints between adjacent magnitudes
+_E2M1_MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+                         dtype=torch.float64)
+
+
+def _f64_to_codes_scales(
+    w: torch.Tensor,
+    want_nibbles: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Dequantized f64 weights [N, K] -> (2-bit codes, UE8M0 scale bytes).
+
+    The sweep-validated requant pipeline: per-block-32 UE8M0 scale along
+    K -> e2m1 snap -> tensor-sym {-4,-1,1,4} via _NIBBLE_TO_CODE.
+    Load-time-only f64 math so midpoint comparisons and tie-breaks match
+    the numpy prototype the sweep validated exactly.
+    """
+    assert w.dtype == torch.float64
+    N, K = w.shape
+    assert K % 32 == 0
+    wb = w.view(N, K // 32, 32)
+    amax = wb.abs().amax(dim=2)
+    # UE8M0: power-of-2 scale mapping block amax onto e2m1 max (6.0)
+    exp = torch.where(amax > 0,
+                      torch.round(torch.log2(amax / 6.0 + 1e-30)),
+                      torch.full_like(amax, -127.0)).clamp_(-127.0, 127.0)
+    scale_bytes = (exp + 127.0).to(torch.uint8)
+    u = wb / torch.exp2(exp).unsqueeze(2)     # exact: power-of-2 division
+    mag = torch.bucketize(u.abs().reshape(N, K),
+                          _E2M1_MID.to(w.device)).to(torch.uint8)
+    neg = torch.signbit(u).reshape(N, K)
+
+    zero_mode = os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto")
+    if zero_mode != "sign":
+        zero = (u == 0.0).reshape(N, K)
+        nz = int(zero.sum())
+        if nz:
+            nneg = int(neg[zero].sum())
+            one_signed = min(nneg, nz - nneg) < 0.05 * nz
+            if zero_mode == "alt" or (zero_mode == "auto" and one_signed):
+                parity = (torch.arange(K, device=w.device, dtype=torch.uint8)
+                          & 1).view(1, K).expand(N, K)
+                neg = torch.where(zero, parity.bool(), neg)
+
+    nibbles = mag | (neg.to(torch.uint8) << 3)
+    codes = _NIBBLE_TO_CODE.to(w.device)[nibbles.long()]
+    return codes, scale_bytes, (nibbles if want_nibbles else None)
+
+
+def fp8_block_to_codes_scales(
+    w_fp8: torch.Tensor,
+    s_block: torch.Tensor,
+    block: int = 128,
+    want_nibbles: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """FP8 block-quant checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
+
+    Dequantize to f64 and re-quantize with the sweep-validated pipeline.
+    """
+    N, K = w_fp8.shape
+    w = w_fp8.double()
+    sb = s_block.double()
+    s = sb.repeat_interleave(block, 0)[:N].repeat_interleave(block, 1)[:, :K]
+    return _f64_to_codes_scales(w * s, want_nibbles)
+
+
+# e2m1 nibble -> value (f64)
+_E2M1_VALS = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.float64)
+
+
+def nvfp4_to_codes_scales(
+    w_packed: torch.Tensor,
+    s_block: torch.Tensor,
+    s2: torch.Tensor,
+    group: int = 16,
+    want_nibbles: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NVFP4 (modelopt) checkpoint -> (2-bit codes, UE8M0 scale bytes)."""
+    N, K2 = w_packed.shape
+    K = K2 * 2
+    assert s_block.shape == (N, K // group), (s_block.shape, N, K, group)
+    nib = mxfp4_to_nibbles(w_packed)                     # [N, K] u8
+    w = _E2M1_VALS.to(w_packed.device)[nib.long()]      # f64
+    s = s_block.double().repeat_interleave(group, dim=1)
+    w = w * s
+    s2 = s2.double().to(w.device)
+    if s2.dim() == 0 or s2.numel() == 1:
+        w = w * s2.reshape(())
+    else:
+        assert s2.shape == (N,), s2.shape
+        w = w * s2.view(N, 1)
+    return _f64_to_codes_scales(w, want_nibbles)
+
+
+# ---------------------------------------------------------------------------
+# Ascend-specific: INT8 per-row dequant + requant
+# ---------------------------------------------------------------------------
+
+
+def int8_per_row_to_codes_scales(
+    w_int8: torch.Tensor,       # [N, K] int8
+    w_scale: torch.Tensor,      # [N, 1] f32
+    w_offset: torch.Tensor,     # [N, 1] f32
+    want_nibbles: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """INT8 per-row quantized checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
+
+    The target model (Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp) stores expert
+    weights as INT8 with per-row f32 scale + offset:
+
+        fp32_weight[row] = (int8_weight[row] - offset[row]) * scale[row]
+
+    This function dequantizes to f64 and re-quantizes using the same
+    sweep-validated pipeline (_f64_to_codes_scales) that all other
+    checkpoint formats feed.
+
+    Args:
+        w_int8:    [N, K] torch.int8 expert weights
+        w_scale:   [N, 1] torch.float32 per-row scales
+        w_offset:  [N, 1] torch.float32 per-row offsets
+        want_nibbles: if True, also return the e2m1 nibbles (for FP4 delta tier)
+
+    Returns:
+        (codes [N, K] u8 0..3, scale_bytes [N, K/32] u8 e8m0,
+         nibbles [N, K] u8 | None)
+    """
+    N, K = w_int8.shape
+    assert K % 32 == 0, f"K={K} must be a multiple of 32 for block-32 scales"
+    assert w_scale.shape == (N, 1), f"scale shape {w_scale.shape} != ({N}, 1)"
+    assert w_offset.shape == (N, 1), f"offset shape {w_offset.shape} != ({N}, 1)"
+
+    # Dequantize INT8 to float64 in one vectorized expression.
+    # The subtraction promotes int8→int64, then double(); multiply by scale.
+    w_fp64 = (w_int8.double() - w_offset.double()) * w_scale.double()
+
+    return _f64_to_codes_scales(w_fp64, want_nibbles)
+
+
+# ---------------------------------------------------------------------------
+# Shared utilities (unchanged from the CUDA source)
+# ---------------------------------------------------------------------------
+
+
+def pack_scales(scales: torch.Tensor) -> torch.Tensor:
+    """[N, K/32] u8 e8m0 -> kernel scale plane [N*K/32] u8.
+
+    Layout: sbyte[nb, ks, r] at (nb*(K/32) + ks)*16 + r.
+    """
+    N, KS = scales.shape
+    assert N % 16 == 0
+    return scales.view(N // 16, 16, KS).transpose(1, 2).contiguous().flatten()
+
+
+def reference_dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """[N, K] codes + [N, K/32] e8m0 scale bytes -> f32 weights (golden ref)."""
+    levels = torch.tensor([-4.0, -1.0, 1.0, 4.0], device=codes.device)
+    vals = levels[codes.long()]
+    s = torch.exp2(scales.float() - 127.0).repeat_interleave(32, dim=-1)
+    return vals * s
